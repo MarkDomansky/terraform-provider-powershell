@@ -1,0 +1,339 @@
+name: Release
+# Version -> build -> test -> publish. semantic-release decides the next
+# version from the commits on the branch that was pushed. GoReleaser then
+# packages the artifacts for that version without publishing, the full Pester
+# E2E suite runs against those exact zips on all three OSes, and only then does
+# semantic-release create the tag and the GitHub release. Nothing is tagged and
+# nothing appears on the releases page unless the suite is green.
+#
+# This same workflow file runs in both repos - the public repo's contents are a
+# squashed promotion of this tree - and the CHANNEL comes from the branch name,
+# resolved per repo in .releaserc.cjs:
+#
+#   dev repo (private)     main -> x.y.z-alpha.N   (always a prerelease)
+#   public repo            beta -> x.y.z-beta.N    (promotions land here)
+#                          main -> x.y.z           (GA, from merging beta)
+#
+# A branch that is not configured for the repo it is running in is inert:
+# semantic-release exits without releasing, so the `beta` trigger costs nothing
+# in the dev repo (which has no beta branch) and `main` is handled correctly in
+# both. Only `main` ever syncs the wiki - see wiki-sync.yml.
+on:
+  push:
+    branches:
+      - main
+      - beta
+    # Docs, examples and the test suite do not ship in the provider binary, so a
+    # push that only touches them cuts no release. A push that also touches
+    # anything else still runs (paths-ignore only skips when *every* changed
+    # file matches). Those commits are not lost - they are folded into the notes
+    # of the next release that does run. Use workflow_dispatch to force one.
+    paths-ignore:
+      - 'docs/**'
+      - 'examples/**'
+      - 'tests/**'
+      - '**/*.md'
+      - 'LICENSE'
+      - '.github/workflows/wiki-sync.yml'
+      - '.github/scripts/Sync-DocsToWiki.ps1'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  pull-requests: write
+
+# semantic-release refuses to run when the local branch is behind the remote,
+# so releases on the SAME branch must not overlap. Different branches are
+# independent release lines (beta vs main) and may run concurrently.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  version:
+    name: Determine Version
+    runs-on: ubuntu-latest
+    outputs:
+      # 'true' when the commits since the last tag warrant a release on this
+      # branch. 'false' on a branch this repo does not release from.
+      publish: ${{ steps.semantic.outputs.new_release_published }}
+      # Bare semver, e.g. 0.1.1-alpha.1 or 0.2.0-beta.1 (no leading v) - matches
+      # the string GoReleaser stamps into archive names.
+      version: ${{ steps.semantic.outputs.new_release_version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: semantic-release (dry run)
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          semantic_version: 24
+          dry_run: true
+          # Required by `preset: conventionalcommits` in .releaserc.cjs. Keep in
+          # sync with the publish job, or the two runs could disagree.
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Report decision
+        run: |
+          if [ "${{ steps.semantic.outputs.new_release_published }}" = "true" ]; then
+            echo "::notice::Next release: v${{ steps.semantic.outputs.new_release_version }}"
+          else
+            echo "::notice::No release warranted for these commits - skipping build."
+          fi
+
+  build-pshost:
+    name: Build PSHost Sidecar
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    strategy:
+      matrix:
+        include:
+          - rid: linux-x64
+            os: ubuntu-latest
+            binary: pshost
+          - rid: linux-arm64
+            os: ubuntu-latest
+            binary: pshost
+          - rid: win-x64
+            os: ubuntu-latest
+            binary: pshost.exe
+          - rid: win-arm64
+            os: ubuntu-latest
+            binary: pshost.exe
+          - rid: osx-x64
+            os: macos-latest
+            binary: pshost
+          - rid: osx-arm64
+            os: macos-latest
+            binary: pshost
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+      - name: Publish PSHost
+        # Publish settings (single-file, self-extract, no-trim) live in the
+        # csproj so local and CI builds stay identical.
+        run: |
+          dotnet publish csharp/PSHost/PSHost.csproj \
+            -r ${{ matrix.rid }} \
+            --self-contained \
+            -c Release \
+            -o dist/${{ matrix.rid }}/
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pshost-${{ matrix.rid }}
+          path: dist/${{ matrix.rid }}/${{ matrix.binary }}
+
+  package:
+    name: Package Release Artifacts
+    needs: [version, build-pshost]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Download all PSHost binaries
+        uses: actions/download-artifact@v4
+        with:
+          # Outside the workspace: GoReleaser refuses to run with untracked
+          # files in the git tree (dist-pshost/ is gitignored, this is not).
+          path: ${{ runner.temp }}/pshost-artifacts/
+      - name: Arrange PSHost binaries for GoReleaser
+        run: |
+          SRC="${{ runner.temp }}/pshost-artifacts"
+          mkdir -p dist-pshost/linux-amd64 dist-pshost/linux-arm64 \
+                   dist-pshost/windows-amd64 dist-pshost/windows-arm64 \
+                   dist-pshost/darwin-amd64 dist-pshost/darwin-arm64
+          cp "$SRC/pshost-linux-x64/pshost"    dist-pshost/linux-amd64/
+          cp "$SRC/pshost-linux-arm64/pshost"  dist-pshost/linux-arm64/
+          cp "$SRC/pshost-win-x64/pshost.exe"  dist-pshost/windows-amd64/
+          cp "$SRC/pshost-win-arm64/pshost.exe" dist-pshost/windows-arm64/
+          cp "$SRC/pshost-osx-x64/pshost"      dist-pshost/darwin-amd64/
+          cp "$SRC/pshost-osx-arm64/pshost"    dist-pshost/darwin-arm64/
+      # GoReleaser derives {{ .Version }} from the current tag. The real tag is
+      # not created until the release is green, so stamp a local-only tag with
+      # the version semantic-release just computed. It is never pushed.
+      - name: Stage local tag for GoReleaser
+        run: git tag -f "v${{ needs.version.outputs.version }}"
+      # Sign checksums only when the GPG secrets are configured; a GitHub-only
+      # release does not require signatures, so their absence must not block it.
+      - name: Check for GPG signing key
+        id: gpg_check
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          if [ -n "$GPG_PRIVATE_KEY" ]; then
+            echo "have_key=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "have_key=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::GPG_PRIVATE_KEY secret not set - checksums will not be signed."
+          fi
+      - name: Import GPG key
+        if: steps.gpg_check.outputs.have_key == 'true'
+        uses: crazy-max/ghaction-import-gpg@v6
+        id: import_gpg
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          passphrase: ${{ secrets.PASSPHRASE }}
+      - name: Run GoReleaser (build + archive + sign, no publish)
+        uses: goreleaser/goreleaser-action@v6
+        with:
+          args: release --clean --skip=publish,announce${{ steps.gpg_check.outputs.have_key == 'true' && '' || ',sign' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
+          GORELEASER_CURRENT_TAG: v${{ needs.version.outputs.version }}
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-dist
+          path: |
+            dist/*.zip
+            dist/*_SHA256SUMS
+            dist/*_SHA256SUMS.sig
+
+  e2e:
+    name: E2E (${{ matrix.platform }})
+    needs: [version, package]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows_amd64
+          - os: ubuntu-latest
+            platform: linux_amd64
+          - os: macos-latest
+            platform: darwin_arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+      - name: Extract release zip for ${{ matrix.platform }}
+        shell: pwsh
+        run: |
+          $ver = $env:RELEASE_VERSION
+          $zip = "dist/terraform-provider-powershell_${ver}_${{ matrix.platform }}.zip"
+          if (-not (Test-Path $zip)) {
+            throw "Missing $zip - dist contains: $((Get-ChildItem dist).Name -join ', ')"
+          }
+          Expand-Archive $zip -DestinationPath release-bin
+          Get-ChildItem release-bin | ForEach-Object Name
+      - name: Make binaries executable
+        if: runner.os != 'Windows'
+        run: chmod +x release-bin/*
+      # Prove the zip itself is installable: real `terraform init` resolving the
+      # provider from a packed filesystem mirror holding the release zip.
+      - name: Install smoke test (terraform init from filesystem mirror)
+        shell: pwsh
+        run: |
+          $ver = $env:RELEASE_VERSION
+          $mirror = Join-Path $pwd 'mirror/registry.terraform.io/markdomansky/powershell'
+          New-Item -ItemType Directory -Force -Path $mirror | Out-Null
+          Copy-Item "dist/terraform-provider-powershell_${ver}_${{ matrix.platform }}.zip" $mirror
+
+          New-Item -ItemType Directory -Force -Path smoke | Out-Null
+          @"
+          terraform {
+            required_providers {
+              powershell = {
+                source  = "markdomansky/powershell"
+                version = "$ver"
+              }
+            }
+          }
+          "@ | Set-Content smoke/main.tf
+
+          $mirrorRoot = (Join-Path $pwd 'mirror') -replace '\\', '/'
+          @"
+          provider_installation {
+            filesystem_mirror {
+              path    = "$mirrorRoot"
+              include = ["registry.terraform.io/markdomansky/powershell"]
+            }
+          }
+          "@ | Set-Content smoke/mirror.tfrc
+
+          $env:TF_CLI_CONFIG_FILE = Join-Path $pwd 'smoke/mirror.tfrc'
+          Push-Location smoke
+          terraform init -input=false
+          if ($LASTEXITCODE -ne 0) { throw "terraform init from mirror failed" }
+      # Full E2E suite against the extracted release binaries (provider +
+      # embedded pshost). PSTF_PROVIDER_BIN_DIR makes the suite use them
+      # verbatim instead of building from source.
+      - name: Run Pester suite against release artifacts
+        shell: pwsh
+        env:
+          PSTF_PROVIDER_BIN_DIR: ${{ github.workspace }}/release-bin
+        run: |
+          Install-Module Pester -Force -SkipPublisherCheck -MinimumVersion 5.0
+          $cfg = New-PesterConfiguration
+          $cfg.Run.Path = 'tests/pester'
+          $cfg.Run.Exit = $true
+          $cfg.Output.Verbosity = 'Detailed'
+          Invoke-Pester -Configuration $cfg
+
+  publish:
+    name: Tag and Publish Release
+    needs: [version, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # semantic-release needs the full history to reach the last tag.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-dist
+          path: dist/
+      - name: Stage registry manifest
+        # Keep the release registry-ready: publish the manifest under the name
+        # the Terraform Registry expects, even though we only release on GitHub.
+        run: |
+          cp terraform-registry-manifest.json \
+             "dist/terraform-provider-powershell_${{ needs.version.outputs.version }}_manifest.json"
+      # Same analysis as the `version` job on the same commit, so it lands on
+      # the same version - but this run creates the tag, generates the notes and
+      # uploads dist/* to a prerelease on the alpha channel.
+      - name: semantic-release (tag + publish)
+        id: semantic
+        uses: cycjimmy/semantic-release-action@v4
+        with:
+          semantic_version: 24
+          # Keep in sync with the version job.
+          extra_plugins: |
+            conventional-changelog-conventionalcommits@8
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Verify published version matches the tested artifacts
+        run: |
+          EXPECTED="${{ needs.version.outputs.version }}"
+          ACTUAL="${{ steps.semantic.outputs.new_release_version }}"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Published v$ACTUAL but the E2E suite tested v$EXPECTED."
+            exit 1
+          fi
+          echo "::notice::Published v$ACTUAL"

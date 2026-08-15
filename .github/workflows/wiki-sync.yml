@@ -1,0 +1,65 @@
+name: Sync Docs to Wiki
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/**'
+      - '.github/scripts/Sync-DocsToWiki.ps1'
+      - '.github/workflows/wiki-sync.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# The wiki is a single shared git repo: never let two runs push at once.
+concurrency:
+  group: wiki-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Render docs/ into the wiki
+    # ONLY main publishes the wiki, in either repo. The push trigger above
+    # already restricts that, but workflow_dispatch can be pointed at any ref -
+    # so re-assert it here. In particular `beta` (the public repo's prerelease
+    # branch) must never overwrite the wiki with prerelease docs.
+    if: github.ref_name == 'main'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      # The wiki repo only exists once the wiki has at least one page. If this
+      # clone fails, create any page in the wiki UI once and re-run.
+      - name: Clone wiki
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if ! git clone --depth 1 \
+            "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.wiki.git" wiki; then
+            echo "::error::Could not clone ${GITHUB_REPOSITORY}.wiki.git. Create the first wiki page in the GitHub UI (Wiki tab -> Create the first page), then re-run this workflow."
+            exit 1
+          fi
+
+      - name: Render docs
+        shell: pwsh
+        run: |
+          ./.github/scripts/Sync-DocsToWiki.ps1 `
+            -DocsPath docs `
+            -WikiPath wiki `
+            -Repository $env:GITHUB_REPOSITORY `
+            -Branch ${{ github.ref_name }}
+
+      - name: Commit and push
+        working-directory: wiki
+        run: |
+          git config user.name  'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+          git add -A
+          if git diff --cached --quiet; then
+            echo "Wiki already up to date."
+            exit 0
+          fi
+          git commit -m "docs: sync from ${GITHUB_SHA::7}"
+          git push
