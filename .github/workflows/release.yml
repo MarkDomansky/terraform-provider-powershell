@@ -131,6 +131,9 @@ jobs:
         with:
           name: pshost-${{ matrix.rid }}
           path: dist/${{ matrix.rid }}/${{ matrix.binary }}
+          # Consumed by `package` minutes later; the sidecars ship inside the
+          # release zips, so there is no reason to keep the loose binaries.
+          retention-days: 1
 
   package:
     name: Package Release Artifacts
@@ -176,8 +179,10 @@ jobs:
         run: |
           if [ -n "$GPG_PRIVATE_KEY" ]; then
             echo "have_key=true" >> "$GITHUB_OUTPUT"
+            echo "skips=publish,announce" >> "$GITHUB_OUTPUT"
           else
             echo "have_key=false" >> "$GITHUB_OUTPUT"
+            echo "skips=publish,announce,sign" >> "$GITHUB_OUTPUT"
             echo "::notice::GPG_PRIVATE_KEY secret not set - checksums will not be signed."
           fi
       - name: Import GPG key
@@ -186,11 +191,20 @@ jobs:
         id: import_gpg
         with:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
-          passphrase: ${{ secrets.PASSPHRASE }}
+          # Without this the key imports LOCKED and gpg tries to prompt on a
+          # runner that has no TTY: "signing failed: Inappropriate ioctl for
+          # device". Both repos need the GPG_PASSPHRASE secret set.
+          passphrase: ${{ secrets.GPG_PASSPHRASE }}
       - name: Run GoReleaser (build + archive + sign, no publish)
         uses: goreleaser/goreleaser-action@v6
         with:
-          args: release --clean --skip=publish,announce${{ steps.gpg_check.outputs.have_key == 'true' && '' || ',sign' }}
+          # The skip list is built in the step above rather than with an inline
+          # `cond && A || B`: Actions' `&&`/`||` yield operand VALUES and treat
+          # '' as falsy, so `have_key == 'true' && '' || ',sign'` evaluated to
+          # ',sign' in BOTH branches and silently disabled signing for every
+          # release. The Terraform Registry rejects a version whose SHA256SUMS
+          # has no .sig, so keep this a plain string output.
+          args: release --clean --skip=${{ steps.gpg_check.outputs.skips }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GPG_FINGERPRINT: ${{ steps.import_gpg.outputs.fingerprint }}
@@ -203,6 +217,11 @@ jobs:
             dist/*.zip
             dist/*_SHA256SUMS
             dist/*_SHA256SUMS.sig
+          # ~300MB. Consumed by `e2e` and `publish` in this run; the week is a
+          # debug window - re-running `publish` or pulling the exact zips the
+          # suite tested after a bad release. The published release keeps them
+          # permanently, so nothing is lost when this expires.
+          retention-days: 7
 
   e2e:
     name: E2E (${{ matrix.platform }})

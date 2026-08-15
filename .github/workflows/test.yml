@@ -73,6 +73,10 @@ jobs:
         with:
           name: pshost-linux-x64
           path: dist/pshost
+          # Handoff to go-test in this same run only - nothing reads it
+          # afterwards, so do not let a ~45MB binary sit for the default
+          # 90 days on every push and PR.
+          retention-days: 1
 
   csharp-test:
     name: C# Unit Tests
