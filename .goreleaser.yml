@@ -1,6 +1,6 @@
 version: 2
 
-# The repo is named terraform-provider-powershell-dev; pin the project name so
+# The repo is named terraform-provider-powershell-alpha; pin the project name so
 # binaries and archives keep the canonical provider name terraform expects.
 project_name: terraform-provider-powershell
 

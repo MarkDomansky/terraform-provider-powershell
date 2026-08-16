@@ -6,7 +6,7 @@
  * means something different in each, so the branch config is chosen at runtime
  * from GITHUB_REPOSITORY:
  *
- *   terraform-provider-powershell-dev (private)
+ *   terraform-provider-powershell-alpha (private)
  *     main    -> x.y.z-alpha.N   prerelease, always; this repo never cuts a GA
  *     stable  -> placeholder release branch (nothing is released from it)
  *
@@ -26,10 +26,17 @@
 
 const repo = (process.env.GITHUB_REPOSITORY || '').toLowerCase();
 
-// Default to the dev (always-prerelease) config when GITHUB_REPOSITORY is not
-// set - i.e. a local run. That is the conservative default: the worst a
-// mis-detection can do here is cut an alpha, never an unintended GA.
-const isPublicRepo = repo !== '' && !repo.endsWith('-dev');
+// Match the PUBLIC repo by name, and treat everything else - this private repo
+// under whatever name it currently carries, and a local run with no
+// GITHUB_REPOSITORY - as dev. That is the conservative direction: the worst a
+// mis-detection can do is cut an alpha, never an unintended GA.
+//
+// This test used to be `!repo.endsWith('-dev')`, which broke the moment the
+// private repo was renamed `...-dev` -> `...-alpha`: it started matching the
+// public config and cut a stable v0.2.0 off `main`. Keep the check anchored to
+// the public name, which promote-beta.yml already hardcodes as PUBLIC_REPO.
+const PUBLIC_REPO = 'markdomansky/terraform-provider-powershell';
+const isPublicRepo = repo === PUBLIC_REPO;
 
 const branches = isPublicRepo
   ? ['main', { name: 'beta', prerelease: 'beta' }]
