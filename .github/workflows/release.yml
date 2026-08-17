@@ -6,18 +6,14 @@ name: Release
 # semantic-release create the tag and the GitHub release. Nothing is tagged and
 # nothing appears on the releases page unless the suite is green.
 #
-# This same workflow file runs in both repos - the public repo's contents are a
-# squashed promotion of this tree - and the CHANNEL comes from the branch name,
-# resolved per repo in .releaserc.cjs:
+# The CHANNEL comes from the branch that was pushed, per .releaserc.cjs:
 #
-#   dev repo (private)     main -> x.y.z-alpha.N   (always a prerelease)
-#   public repo            beta -> x.y.z-beta.N    (promotions land here)
-#                          main -> x.y.z           (GA, from merging beta)
+#   beta -> x.y.z-beta.N   (prerelease; every squash-merged PR lands here)
+#   main -> x.y.z          (GA, from merging beta into main)
 #
-# A branch that is not configured for the repo it is running in is inert:
-# semantic-release exits without releasing, so the `beta` trigger costs nothing
-# in the dev repo (which has no beta branch) and `main` is handled correctly in
-# both. Only `main` ever syncs the wiki - see wiki-sync.yml.
+# Merge beta into main with a real merge commit, never a squash - the analyzer
+# needs the individual conventional commits to pick the GA bump.
+# Only `main` ever syncs the wiki - see wiki-sync.yml.
 on:
   push:
     branches:
@@ -58,7 +54,7 @@ jobs:
       # 'true' when the commits since the last tag warrant a release on this
       # branch. 'false' on a branch this repo does not release from.
       publish: ${{ steps.semantic.outputs.new_release_published }}
-      # Bare semver, e.g. 0.1.1-alpha.1 or 0.2.0-beta.1 (no leading v) - matches
+      # Bare semver, e.g. 0.2.0-beta.1 or 0.2.0 (no leading v) - matches
       # the string GoReleaser stamps into archive names.
       version: ${{ steps.semantic.outputs.new_release_version }}
     steps:
@@ -193,7 +189,7 @@ jobs:
           gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
           # Without this the key imports LOCKED and gpg tries to prompt on a
           # runner that has no TTY: "signing failed: Inappropriate ioctl for
-          # device". Both repos need the GPG_PASSPHRASE secret set.
+          # device". The GPG_PASSPHRASE secret must be set alongside the key.
           passphrase: ${{ secrets.GPG_PASSPHRASE }}
       - name: Run GoReleaser (build + archive + sign, no publish)
         uses: goreleaser/goreleaser-action@v6
@@ -336,7 +332,7 @@ jobs:
              "dist/terraform-provider-powershell_${{ needs.version.outputs.version }}_manifest.json"
       # Same analysis as the `version` job on the same commit, so it lands on
       # the same version - but this run creates the tag, generates the notes and
-      # uploads dist/* to a prerelease on the alpha channel.
+      # uploads dist/* to the release on this branch's channel.
       - name: semantic-release (tag + publish)
         id: semantic
         uses: cycjimmy/semantic-release-action@v4
