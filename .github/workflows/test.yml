@@ -13,8 +13,8 @@ on:
       - '.github/workflows/wiki-sync.yml'
       - '.github/scripts/Sync-DocsToWiki.ps1'
   pull_request:
-    # `beta` is included so a promotion PR into the public repo's beta branch is
-    # validated before it can be merged (see promote-beta.yml in the dev repo).
+    # `beta` is the day-to-day target: work lands as squash-merged PRs into it.
+    # `main` only ever receives the beta -> main GA merge.
     branches: [main, beta]
     # Keep in sync with the push filter above (Actions does not support YAML
     # anchors, so this has to be repeated).

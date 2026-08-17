@@ -1,7 +1,9 @@
 version: 2
 
-# The repo is named terraform-provider-powershell-alpha; pin the project name so
-# binaries and archives keep the canonical provider name terraform expects.
+# Pinned rather than inferred from the repo name: binaries and archives must
+# carry the canonical provider name terraform expects, whatever the repo is
+# called. (This mattered when the tree also lived in a `-alpha` repo; keep it
+# pinned so a future rename cannot leak into artifact names.)
 project_name: terraform-provider-powershell
 
 before:
@@ -42,6 +44,15 @@ release:
       name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
 
 checksum:
+  # The manifest must have a line in SHA256SUMS, not just be uploaded next to
+  # it: the Terraform Registry refuses a version with "missing SHA256 checksum
+  # for ..._manifest.json". `release.extra_files` above only covers the upload,
+  # and this pipeline skips GoReleaser's publish step anyway, so without this
+  # block the manifest is never checksummed. The name_template must match the
+  # one used for the upload, or the checksum line names a file nobody ships.
+  extra_files:
+    - glob: 'terraform-registry-manifest.json'
+      name_template: '{{ .ProjectName }}_{{ .Version }}_manifest.json'
   name_template: '{{ .ProjectName }}_{{ .Version }}_SHA256SUMS'
   algorithm: sha256
 

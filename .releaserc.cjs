@@ -1,59 +1,50 @@
 /**
  * semantic-release configuration.
  *
- * This one file ships to BOTH repos - the public repo's contents are a squashed
- * promotion of this tree (see .github/workflows/promote-beta.yml) - but `main`
- * means something different in each, so the branch config is chosen at runtime
- * from GITHUB_REPOSITORY:
+ *   beta -> x.y.z-beta.N   prerelease; every squash-merged PR lands here
+ *   main -> x.y.z          GA, cut by merging beta into main
  *
- *   terraform-provider-powershell-alpha (private)
- *     main    -> x.y.z-alpha.N   prerelease, always; this repo never cuts a GA
- *     stable  -> placeholder release branch (nothing is released from it)
+ * Merge beta into main with a REAL merge commit, never a squash: the analyzer
+ * derives the GA bump from the individual conventional commits, and a squash
+ * collapses them into one message and one (probably wrong) bump.
  *
- *   terraform-provider-powershell (public)
- *     beta    -> x.y.z-beta.N    prerelease; where promotions land
- *     main    -> x.y.z           GA, cut by merging beta into main
+ * `main` is the required non-prerelease branch, so no `stable` placeholder is
+ * needed here. semantic-release fails with ERELEASEBRANCHES when every
+ * configured branch is a prerelease - that is why the retired always-alpha dev
+ * repo needed one - and it silently DROPS configured branches that do not
+ * exist on the remote, so both branches above must exist.
  *
- * semantic-release requires at least one non-prerelease ("release") branch in
- * every configuration and silently DROPS configured branches that do not exist
- * on the remote - which is why `stable` has to exist on the dev remote even
- * though nothing is ever released from it (otherwise: ERELEASEBRANCHES).
+ * No plugin below writes back to the repo (no @semantic-release/git, no
+ * changelog file), so releasing never moves a branch and no back-merge into
+ * beta is needed after a GA.
  *
  * This must stay a .cjs file, not YAML: cosmiconfig searches
  * .releaserc.yaml/.yml BEFORE .releaserc.js/.cjs, so a leftover .releaserc.yml
  * would win and silently shadow this file. Do not re-add one.
  */
 
-const repo = (process.env.GITHUB_REPOSITORY || '').toLowerCase();
-
-// Match the PUBLIC repo by name, and treat everything else - this private repo
-// under whatever name it currently carries, and a local run with no
-// GITHUB_REPOSITORY - as dev. That is the conservative direction: the worst a
-// mis-detection can do is cut an alpha, never an unintended GA.
-//
-// This test used to be `!repo.endsWith('-dev')`, which broke the moment the
-// private repo was renamed `...-dev` -> `...-alpha`: it started matching the
-// public config and cut a stable v0.2.0 off `main`. Keep the check anchored to
-// the public name, which promote-beta.yml already hardcodes as PUBLIC_REPO.
-const PUBLIC_REPO = 'markdomansky/terraform-provider-powershell';
-const isPublicRepo = repo === PUBLIC_REPO;
-
-const branches = isPublicRepo
-  ? ['main', { name: 'beta', prerelease: 'beta' }]
-  : ['stable', { name: 'main', prerelease: 'alpha' }];
-
 module.exports = {
-  branches,
+  branches: ['main', { name: 'beta', prerelease: 'beta' }],
 
   tagFormat: 'v${version}',
 
   plugins: [
-    // Conventional commits behave as usual (feat -> minor, BREAKING CHANGE: or
-    // a `!` after the type -> major). The `**` catch-all makes every other
-    // commit message a patch, so free-form commits still cut a release instead
-    // of silently releasing nothing. Delete that last rule to release only on
-    // conventional commits. To land a commit without releasing, put [skip ci]
-    // in the message.
+    // `feat` -> minor, everything else -> patch. The `**` catch-all makes any
+    // other commit message a patch, so free-form commits still cut a release
+    // instead of silently releasing nothing. Delete that last rule to release
+    // only on conventional commits. To land a commit without releasing, put
+    // [skip ci] in the message.
+    //
+    // BREAKING -> MINOR, ON PURPOSE. A breaking change would normally bump the
+    // major, which from 0.x means jumping straight to 1.0.0 - a commitment to
+    // 1.0 API stability made by accident, by one commit message, now that
+    // `main` cuts real GAs. Mapping it to minor keeps the provider in 0.x
+    // (0.1.x -> 0.2.0) where breaking changes are expected. This only changes
+    // the VERSION: `BREAKING CHANGE:` footers are still rendered by
+    // release-notes-generator, so the release notes keep shouting about them.
+    //
+    // Going 1.0 is therefore a deliberate act: delete this rule (restoring
+    // `release: 'major'`) or force the version once, then merge to main.
     //
     // preset: the default (angular) preset does NOT understand the `feat!:`
     // shorthand - such a commit fails to parse and drops to the catch-all as a
@@ -64,7 +55,7 @@ module.exports = {
       {
         preset: 'conventionalcommits',
         releaseRules: [
-          { breaking: true, release: 'major' },
+          { breaking: true, release: 'minor' },
           { type: 'feat', release: 'minor' },
           { revert: true, release: 'patch' },
           { message: '**', release: 'patch' },
