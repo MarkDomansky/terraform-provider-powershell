@@ -6,7 +6,7 @@ import (
 	"log"
 
 	"github.com/hashicorp/terraform-plugin-framework/providerserver"
-	"github.com/markdomansky/terraform-provider-powershell/internal/provider"
+	"github.com/markdomansky/terraform-provider-powershell/scriptprovider"
 )
 
 var version = "0.1-dev"
@@ -23,7 +23,7 @@ func main() {
 
 	// Use a tracking factory so we can run each provider's shutdown script and
 	// stop its PowerShell process once Serve returns (i.e. the run is over).
-	factory := provider.NewFactory(version)
+	factory := scriptprovider.NewFactory(version)
 
 	err := providerserver.Serve(context.Background(), factory.New(), opts)
 

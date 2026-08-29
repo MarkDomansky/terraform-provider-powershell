@@ -8,7 +8,7 @@ HCL — so the whole shipped stack (provider binary → sidecar process → Powe
 runspace) is covered, including provider aliases and terraform's
 `provider = powershell.<alias>` routing.
 
-This is the counterpart to the Go unit tests in `internal/provider/`, which keep
+This is the counterpart to the Go unit tests in `scriptprovider/`, which keep
 covering the Go-only layers (PSManager protocol, `Configure`, the `Factory`, and
 `Close` idempotency) that terraform can't reach.
 

@@ -1,4 +1,4 @@
-package provider
+package scriptprovider
 
 import (
 	"bufio"
@@ -75,9 +75,10 @@ type PSManager struct {
 
 	defaultTimeout time.Duration // used when a command passes timeout == 0
 
-	// shutdownScript is run once during Close, before the process is torn down.
-	shutdownScript  string
-	shutdownTimeout time.Duration
+	// shutdownScripts run once during Close, in registration order, before the
+	// process is torn down. Multiple entries let a definition-based provider run
+	// the practitioner's shutdown_script first and its own shutdown.ps1 second.
+	shutdownScripts []shutdownEntry
 	closed          bool
 	// terminated is set when a command times out and the sidecar is force-killed.
 	// Unlike closed (graceful), it makes every subsequent Execute fail fast, because
@@ -316,15 +317,24 @@ func (m *PSManager) readResponse() (*PSResponse, error) {
 	return nil, fmt.Errorf("pshost sidecar exited without sending a response")
 }
 
+// shutdownEntry is one registered shutdown script with its execution timeout.
+type shutdownEntry struct {
+	script  string
+	timeout time.Duration
+}
+
 // SetShutdownScript registers a script that Close runs exactly once, in the same
 // persistent PowerShell process, just before the process is terminated. Because it
 // shares the process (and remote session, if any) with every resource operation, it
-// can observe any globals accumulated during the run.
+// can observe any globals accumulated during the run. Calling it more than once
+// appends: Close runs every registered script in registration order.
 func (m *PSManager) SetShutdownScript(script string, timeout time.Duration) {
+	if script == "" {
+		return
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.shutdownScript = script
-	m.shutdownTimeout = timeout
+	m.shutdownScripts = append(m.shutdownScripts, shutdownEntry{script: script, timeout: timeout})
 }
 
 // Close runs the registered shutdown script (if any) and then shuts down the
@@ -337,19 +347,24 @@ func (m *PSManager) Close() error {
 		return nil
 	}
 	m.closed = true
-	shutdownScript := m.shutdownScript
-	shutdownTimeout := m.shutdownTimeout
+	shutdownScripts := m.shutdownScripts
 	m.mu.Unlock()
 
-	// Run the shutdown script first, while the process is still alive. Execute
-	// acquires the mutex itself; the closed flag guarantees this happens once.
+	// Run the shutdown scripts first, in registration order, while the process is
+	// still alive. Execute acquires the mutex itself; the closed flag guarantees
+	// this happens once. The first failure is reported, but later scripts still
+	// run so a fork's cleanup is not skipped because the practitioner's failed.
 	var shutdownErr error
-	if shutdownScript != "" {
-		result, err := m.Execute("shutdown", shutdownScript, nil, shutdownTimeout)
+	for _, entry := range shutdownScripts {
+		result, err := m.Execute("shutdown", entry.script, nil, entry.timeout)
 		if err != nil {
-			shutdownErr = fmt.Errorf("shutdown script execution failed: %w", err)
+			if shutdownErr == nil {
+				shutdownErr = fmt.Errorf("shutdown script execution failed: %w", err)
+			}
 		} else if !result.Success {
-			shutdownErr = fmt.Errorf("shutdown script returned an error: %s", result.Error)
+			if shutdownErr == nil {
+				shutdownErr = fmt.Errorf("shutdown script returned an error: %s", result.Error)
+			}
 		}
 	}
 

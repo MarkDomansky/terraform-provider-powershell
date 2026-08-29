@@ -8,6 +8,10 @@ description: |-
 
 Manages a resource through PowerShell CRUD scriptblocks. Each lifecycle action (create, read, update, delete) is handled by a separate PowerShell script. Scripts receive input through a bound `$InputData` parameter and return output by emitting exactly one object to the PowerShell output (success) stream. Inputs and the emitted object are exchanged as JSON.
 
+~> For a script that only **looks something up** — no lifecycle, no state, no
+drift — use the [`powershell_script` data source](../data-sources/script.md)
+instead.
+
 ## Example Usage
 
 ```hcl

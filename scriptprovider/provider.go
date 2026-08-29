@@ -1,4 +1,4 @@
-package provider
+package scriptprovider
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/provider"
 	"github.com/hashicorp/terraform-plugin-framework/provider/schema"
@@ -85,26 +86,44 @@ func New(version string) func() provider.Provider {
 	}
 }
 
+// ShutdownProvider is a provider whose persistent PowerShell process (and
+// registered shutdown scripts) can be torn down after serving stops. Both the
+// generic PowerShellProvider and definition-based providers implement it.
+type ShutdownProvider interface {
+	provider.Provider
+	Shutdown(context.Context) error
+}
+
 // Factory creates provider instances while tracking them, so their persistent
 // PowerShell processes (and shutdown scripts) can be cleanly torn down when the
 // provider server stops. The terraform-plugin-framework offers no provider-level
 // teardown callback, so the serving entrypoint must call Shutdown itself.
 type Factory struct {
-	version   string
-	mu        sync.Mutex
-	instances []*PowerShellProvider
+	newProvider func() ShutdownProvider
+	mu          sync.Mutex
+	instances   []ShutdownProvider
 }
 
-// NewFactory returns a Factory that builds providers reporting the given version.
+// NewFactory returns a Factory that builds generic powershell providers
+// reporting the given version.
 func NewFactory(version string) *Factory {
-	return &Factory{version: version}
+	return NewFactoryWith(func() ShutdownProvider {
+		return &PowerShellProvider{version: version}
+	})
+}
+
+// NewFactoryWith returns a Factory that builds and tracks instances produced by
+// the given constructor. Used by definition-based (derived) providers, which
+// construct a different provider type but need the same teardown tracking.
+func NewFactoryWith(newProvider func() ShutdownProvider) *Factory {
+	return &Factory{newProvider: newProvider}
 }
 
 // New returns a provider factory function suitable for providerserver.Serve.
 // Every instance it creates is tracked for later Shutdown.
 func (f *Factory) New() func() provider.Provider {
 	return func() provider.Provider {
-		p := &PowerShellProvider{version: f.version}
+		p := f.newProvider()
 		f.mu.Lock()
 		f.instances = append(f.instances, p)
 		f.mu.Unlock()
@@ -137,133 +156,141 @@ func (p *PowerShellProvider) Schema(_ context.Context, _ provider.SchemaRequest,
 		Description: "The PowerShell provider executes PowerShell scriptblocks for Terraform resource CRUD operations. " +
 			"It maintains a persistent PowerShell process for the lifetime of the Terraform run, " +
 			"enabling provider-level state sharing across all resource operations.",
-		Attributes: map[string]schema.Attribute{
-			"startup_script": schema.StringAttribute{
-				Description: "PowerShell script to execute during provider initialization (after any remote " +
-					"session is opened). Use this to set up provider-level state in your own globals " +
-					"(e.g. $global:ProviderState = @{}), authenticate, or load modules. Globals persist " +
-					"across all resource operations because the runspace is persistent.",
-				Optional: true,
-			},
-			"shutdown_script": schema.StringAttribute{
-				Description: "PowerShell script to execute once when the provider tears down, " +
-					"after all resource operations have completed. It runs in the same persistent " +
-					"process (and remote session, if any) as the startup script and every resource, so it " +
-					"can read the globals it created to clean up (e.g. sign out, release leases, flush buffers).",
-				Optional: true,
-			},
-			"timeout": schema.Int64Attribute{
-				Description: "Default timeout in seconds for script execution. " +
-					"Individual resources can override this. Defaults to 3600 (1 hour).",
-				Optional: true,
-				Validators: []validator.Int64{
-					int64validator.AtLeast(1),
-				},
-			},
+		Attributes: builtinProviderAttributes(),
+	}
+}
 
-			// --- Connection arguments -------------------------------------------------
-			// All optional. Whatever is set is exposed to every script (startup,
-			// CRUD, shutdown) as the $global:ProviderData hashtable, e.g.
-			// $global:ProviderData.server / .username / .Data.foo
-			"server": schema.StringAttribute{
-				Description: "Target server made available to scripts as $global:ProviderData.server.",
-				Optional:    true,
+// builtinProviderAttributes returns the provider-block attributes shared by the
+// generic powershell provider and every definition-based (derived) provider.
+// Derived providers merge their custom attributes on top of this map. The map is
+// rebuilt on every call so callers may mutate their copy safely.
+func builtinProviderAttributes() map[string]schema.Attribute {
+	return map[string]schema.Attribute{
+		"startup_script": schema.StringAttribute{
+			Description: "PowerShell script to execute during provider initialization (after any remote " +
+				"session is opened). Use this to set up provider-level state in your own globals " +
+				"(e.g. $global:ProviderState = @{}), authenticate, or load modules. Globals persist " +
+				"across all resource operations because the runspace is persistent.",
+			Optional: true,
+		},
+		"shutdown_script": schema.StringAttribute{
+			Description: "PowerShell script to execute once when the provider tears down, " +
+				"after all resource operations have completed. It runs in the same persistent " +
+				"process (and remote session, if any) as the startup script and every resource, so it " +
+				"can read the globals it created to clean up (e.g. sign out, release leases, flush buffers).",
+			Optional: true,
+		},
+		"timeout": schema.Int64Attribute{
+			Description: "Default timeout in seconds for script execution. " +
+				"Individual resources can override this. Defaults to 3600 (1 hour).",
+			Optional: true,
+			Validators: []validator.Int64{
+				int64validator.AtLeast(1),
 			},
-			"username": schema.StringAttribute{
-				Description: "Username made available to scripts as $global:ProviderData.username.",
-				Optional:    true,
-			},
-			"password": schema.StringAttribute{
-				Description: "Password made available to scripts as $global:ProviderData.password. " +
-					"Marked sensitive so it is redacted from CLI output. Provider configuration is never " +
-					"stored in Terraform state, but it is embedded in saved plan files (terraform plan -out). " +
-					"Can also be supplied via the " + envPassword + " environment variable.",
-				Optional:  true,
-				Sensitive: true,
-			},
-			"cert_thumbprint": schema.StringAttribute{
-				Description: "Certificate thumbprint made available to scripts as $global:ProviderData.cert_thumbprint.",
-				Optional:    true,
-			},
-			"provider_data": schema.StringAttribute{
-				Description: "Arbitrary provider data as a JSON object string (use jsonencode({...})). " +
-					"Decoded to a hashtable and exposed to scripts as $global:ProviderData.Data.",
-				Optional: true,
-				Validators: []validator.String{
-					jsonObjectValidator{},
-				},
-			},
-			"sensitive_provider_data": schema.StringAttribute{
-				Description: "Arbitrary sensitive provider data as a JSON object string (use jsonencode({...})). " +
-					"Decoded to a hashtable and exposed to scripts as $global:ProviderData.SensitiveData. " +
-					"Marked sensitive so it is redacted from CLI output.",
-				Optional:  true,
-				Sensitive: true,
-				Validators: []validator.String{
-					jsonObjectValidator{},
-				},
-			},
+		},
 
-			// --- Remote session arguments (session_*) ---------------------------------
-			// When session_type is set, the host opens a remote PowerShell session
-			// (New-PSSession) before the startup script and runs EVERY script in that
-			// remote runspace. The session is closed after shutdown_script.
-			"session_type": schema.StringAttribute{
-				Description: "Remote session transport: \"winrm\", \"ssh\", or \"vmguest\". " +
-					"Leave unset to run scripts locally.",
-				Optional: true,
-				Validators: []validator.String{
-					stringvalidator.OneOf("winrm", "ssh", "vmguest"),
-				},
+		// --- Connection arguments -------------------------------------------------
+		// All optional. Whatever is set is exposed to every script (startup,
+		// CRUD, shutdown) as the $global:ProviderData hashtable, e.g.
+		// $global:ProviderData.server / .username / .Data.foo
+		"server": schema.StringAttribute{
+			Description: "Target server made available to scripts as $global:ProviderData.server.",
+			Optional:    true,
+		},
+		"username": schema.StringAttribute{
+			Description: "Username made available to scripts as $global:ProviderData.username.",
+			Optional:    true,
+		},
+		"password": schema.StringAttribute{
+			Description: "Password made available to scripts as $global:ProviderData.password. " +
+				"Marked sensitive so it is redacted from CLI output. Provider configuration is never " +
+				"stored in Terraform state, but it is embedded in saved plan files (terraform plan -out). " +
+				"Can also be supplied via the " + envPassword + " environment variable.",
+			Optional:  true,
+			Sensitive: true,
+		},
+		"cert_thumbprint": schema.StringAttribute{
+			Description: "Certificate thumbprint made available to scripts as $global:ProviderData.cert_thumbprint.",
+			Optional:    true,
+		},
+		"provider_data": schema.StringAttribute{
+			Description: "Arbitrary provider data as a JSON object string (use jsonencode({...})). " +
+				"Decoded to a hashtable and exposed to scripts as $global:ProviderData.Data.",
+			Optional: true,
+			Validators: []validator.String{
+				jsonObjectValidator{},
 			},
-			"session_host": schema.StringAttribute{
-				Description: "Remote computer name or hostname to connect to (winrm and ssh).",
-				Optional:    true,
+		},
+		"sensitive_provider_data": schema.StringAttribute{
+			Description: "Arbitrary sensitive provider data as a JSON object string (use jsonencode({...})). " +
+				"Decoded to a hashtable and exposed to scripts as $global:ProviderData.SensitiveData. " +
+				"Marked sensitive so it is redacted from CLI output.",
+			Optional:  true,
+			Sensitive: true,
+			Validators: []validator.String{
+				jsonObjectValidator{},
 			},
-			"session_port": schema.Int64Attribute{
-				Description: "Optional port override for the remote connection.",
-				Optional:    true,
+		},
+
+		// --- Remote session arguments (session_*) ---------------------------------
+		// When session_type is set, the host opens a remote PowerShell session
+		// (New-PSSession) before the startup script and runs EVERY script in that
+		// remote runspace. The session is closed after shutdown_script.
+		"session_type": schema.StringAttribute{
+			Description: "Remote session transport: \"winrm\", \"ssh\", or \"vmguest\". " +
+				"Leave unset to run scripts locally.",
+			Optional: true,
+			Validators: []validator.String{
+				stringvalidator.OneOf("winrm", "ssh", "vmguest"),
 			},
-			"session_username": schema.StringAttribute{
-				Description: "Username for the remote session credential.",
-				Optional:    true,
-			},
-			"session_password": schema.StringAttribute{
-				Description: "Password for the remote session credential. Marked sensitive. " +
-					"Can also be supplied via the " + envSessionPassword + " environment variable.",
-				Optional:  true,
-				Sensitive: true,
-			},
-			"session_use_ssl": schema.BoolAttribute{
-				Description: "winrm only: connect over HTTPS (WinRM port 5986).",
-				Optional:    true,
-			},
-			"session_authentication": schema.StringAttribute{
-				Description: "winrm only: authentication mechanism " +
-					"(Default, Basic, Negotiate, Kerberos, Credssp, Digest, NegotiateWithImplicitCredential).",
-				Optional: true,
-			},
-			"session_cert_thumbprint": schema.StringAttribute{
-				Description: "winrm only: client-certificate thumbprint for certificate authentication " +
-					"(used instead of username/password).",
-				Optional: true,
-			},
-			"session_configuration_name": schema.StringAttribute{
-				Description: "winrm only: the session configuration (endpoint) to connect to, e.g. \"PowerShell.7\".",
-				Optional:    true,
-			},
-			"session_key_file": schema.StringAttribute{
-				Description: "ssh only: path to the private key file used for authentication.",
-				Optional:    true,
-			},
-			"session_vm_name": schema.StringAttribute{
-				Description: "vmguest only: the VM name to connect to via PowerShell Direct (requires session_username/session_password).",
-				Optional:    true,
-			},
-			"session_vm_id": schema.StringAttribute{
-				Description: "vmguest only: the VM GUID to connect to via PowerShell Direct (alternative to session_vm_name).",
-				Optional:    true,
-			},
+		},
+		"session_host": schema.StringAttribute{
+			Description: "Remote computer name or hostname to connect to (winrm and ssh).",
+			Optional:    true,
+		},
+		"session_port": schema.Int64Attribute{
+			Description: "Optional port override for the remote connection.",
+			Optional:    true,
+		},
+		"session_username": schema.StringAttribute{
+			Description: "Username for the remote session credential.",
+			Optional:    true,
+		},
+		"session_password": schema.StringAttribute{
+			Description: "Password for the remote session credential. Marked sensitive. " +
+				"Can also be supplied via the " + envSessionPassword + " environment variable.",
+			Optional:  true,
+			Sensitive: true,
+		},
+		"session_use_ssl": schema.BoolAttribute{
+			Description: "winrm only: connect over HTTPS (WinRM port 5986).",
+			Optional:    true,
+		},
+		"session_authentication": schema.StringAttribute{
+			Description: "winrm only: authentication mechanism " +
+				"(Default, Basic, Negotiate, Kerberos, Credssp, Digest, NegotiateWithImplicitCredential).",
+			Optional: true,
+		},
+		"session_cert_thumbprint": schema.StringAttribute{
+			Description: "winrm only: client-certificate thumbprint for certificate authentication " +
+				"(used instead of username/password).",
+			Optional: true,
+		},
+		"session_configuration_name": schema.StringAttribute{
+			Description: "winrm only: the session configuration (endpoint) to connect to, e.g. \"PowerShell.7\".",
+			Optional:    true,
+		},
+		"session_key_file": schema.StringAttribute{
+			Description: "ssh only: path to the private key file used for authentication.",
+			Optional:    true,
+		},
+		"session_vm_name": schema.StringAttribute{
+			Description: "vmguest only: the VM name to connect to via PowerShell Direct (requires session_username/session_password).",
+			Optional:    true,
+		},
+		"session_vm_id": schema.StringAttribute{
+			Description: "vmguest only: the VM GUID to connect to via PowerShell Direct (alternative to session_vm_name).",
+			Optional:    true,
 		},
 	}
 }
@@ -280,6 +307,36 @@ func (p *PowerShellProvider) Configure(ctx context.Context, req provider.Configu
 		return
 	}
 
+	psManager := configureEngine(ctx, config, nil, "", "", &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	p.psManager = psManager
+
+	// Hand a reference to this configured provider to every resource and data
+	// source. Their Configure methods receive it as req.ProviderData, which is
+	// how they reach the shared psManager.
+	resp.DataSourceData = p
+	resp.ResourceData = p
+}
+
+// configureEngine performs the engine bootstrap shared by the generic powershell
+// provider and definition-based (derived) providers: environment fallbacks for
+// secrets, timeout defaulting, sidecar launch, the one-time configure command
+// (provider data + optional remote session), startup script(s), and shutdown
+// script registration. It returns the ready PSManager, or nil after appending a
+// diagnostic on failure.
+//
+// extraProviderData (may be nil) is merged into $global:ProviderData under the
+// reserved "Config" key — the channel for a derived provider's custom typed
+// provider attributes. definitionStartupScript runs before the practitioner's
+// startup_script (a derived provider connects first, then the practitioner
+// customizes); definitionShutdownScript is registered after the practitioner's
+// shutdown_script, so teardown mirrors startup in reverse.
+func configureEngine(ctx context.Context, config PowerShellProviderModel,
+	extraProviderData map[string]interface{},
+	definitionStartupScript, definitionShutdownScript string,
+	diags *diag.Diagnostics) *PSManager {
 	// Fall back to environment variables for the secrets, so they can stay out
 	// of .tf/.tfvars files entirely. Explicit configuration wins over env.
 	if config.Password.IsNull() {
@@ -306,11 +363,11 @@ func (p *PowerShellProvider) Configure(ctx context.Context, req provider.Configu
 
 	psManager, err := NewPSManager(ctx, timeout)
 	if err != nil {
-		resp.Diagnostics.AddError(
+		diags.AddError(
 			"Failed to initialize PowerShell",
 			fmt.Sprintf("Could not start pshost sidecar process: %s\n\nEnsure the pshost sidecar binary is present alongside the provider executable or on PATH.", err),
 		)
-		return
+		return nil
 	}
 
 	// Always send the one-time configure command before the startup script. It seeds
@@ -320,19 +377,49 @@ func (p *PowerShellProvider) Configure(ctx context.Context, req provider.Configu
 	providerData, dataErr := buildProviderData(config)
 	if dataErr != nil {
 		_ = psManager.Close()
-		resp.Diagnostics.AddError(
+		diags.AddError(
 			"Invalid provider data",
 			dataErr.Error(),
 		)
-		return
+		return nil
+	}
+	// A derived provider's custom typed attributes ride under the reserved
+	// "Config" key, so they can never collide with the practitioner-supplied
+	// provider_data ("Data") and sensitive_provider_data ("SensitiveData").
+	if len(extraProviderData) > 0 {
+		providerData["Config"] = extraProviderData
 	}
 	if err := psManager.Configure(providerData, buildSessionConfig(config), timeout); err != nil {
 		_ = psManager.Close()
-		resp.Diagnostics.AddError(
+		diags.AddError(
 			"Provider configuration failed",
 			fmt.Sprintf("Failed to configure the PowerShell host (provider data / remote session): %s", err),
 		)
-		return
+		return nil
+	}
+
+	// A derived provider's embedded startup.ps1 runs first (typically connect /
+	// authenticate using $global:ProviderData.Config), so the practitioner's
+	// startup_script below runs against an already-initialized provider.
+	if definitionStartupScript != "" {
+		tflog.Info(ctx, "Executing provider definition startup script")
+		result, err := psManager.Execute("startup", definitionStartupScript, nil, timeout)
+		if err != nil {
+			_ = psManager.Close()
+			diags.AddError(
+				"Provider startup failed",
+				fmt.Sprintf("Failed to execute the provider's built-in startup script: %s", err),
+			)
+			return nil
+		}
+		if !result.Success {
+			_ = psManager.Close()
+			diags.AddError(
+				"Provider startup failed",
+				fmt.Sprintf("The provider's built-in startup script returned an error: %s", result.Error),
+			)
+			return nil
+		}
 	}
 
 	// Run the startup script if provided
@@ -343,41 +430,41 @@ func (p *PowerShellProvider) Configure(ctx context.Context, req provider.Configu
 			result, err := psManager.Execute("startup", startupScript, nil, timeout)
 			if err != nil {
 				_ = psManager.Close()
-				resp.Diagnostics.AddError(
+				diags.AddError(
 					"Startup script failed",
 					fmt.Sprintf("Failed to execute provider startup script: %s", err),
 				)
-				return
+				return nil
 			}
 			if !result.Success {
 				_ = psManager.Close()
-				resp.Diagnostics.AddError(
+				diags.AddError(
 					"Startup script failed",
 					fmt.Sprintf("Provider startup script returned an error: %s", result.Error),
 				)
-				return
+				return nil
 			}
 			tflog.Info(ctx, "Provider startup script completed successfully")
 		}
 	}
 
-	// Register the shutdown script so it runs once when the provider tears down.
-	// It is executed by Shutdown/Close, not here, so it sees state accumulated by
-	// every resource that ran in between.
+	// Register the shutdown scripts so they run once when the provider tears
+	// down. They are executed by Shutdown/Close, not here, so they see state
+	// accumulated by every resource that ran in between. Order mirrors startup
+	// in reverse: the practitioner's shutdown_script first, then the derived
+	// provider's shutdown.ps1 (typically disconnect).
 	if !config.ShutdownScript.IsNull() && !config.ShutdownScript.IsUnknown() {
 		if shutdownScript := config.ShutdownScript.ValueString(); shutdownScript != "" {
 			psManager.SetShutdownScript(shutdownScript, timeout)
 			tflog.Info(ctx, "Registered provider shutdown script")
 		}
 	}
+	if definitionShutdownScript != "" {
+		psManager.SetShutdownScript(definitionShutdownScript, timeout)
+		tflog.Info(ctx, "Registered provider definition shutdown script")
+	}
 
-	p.psManager = psManager
-
-	// Hand a reference to this configured provider to every resource and data
-	// source. Their Configure methods receive it as req.ProviderData, which is
-	// how they reach the shared psManager.
-	resp.DataSourceData = p
-	resp.ResourceData = p
+	return psManager
 }
 
 // strOrEmpty returns the string value of a types.String, or "" when it is null or
@@ -439,6 +526,12 @@ func (p *PowerShellProvider) ValidateConfig(ctx context.Context, req provider.Va
 		return
 	}
 
+	validateSessionConfig(config, &resp.Diagnostics)
+}
+
+// validateSessionConfig holds the cross-attribute session_* rules shared by the
+// generic provider's ValidateConfig and definition-based (derived) providers.
+func validateSessionConfig(config PowerShellProviderModel, diags *diag.Diagnostics) {
 	sessionType := ""
 	if !config.SessionType.IsUnknown() && !config.SessionType.IsNull() {
 		sessionType = config.SessionType.ValueString()
@@ -471,7 +564,7 @@ func (p *PowerShellProvider) ValidateConfig(ctx context.Context, req provider.Va
 		for _, group := range []map[string]bool{winrmOnly, sshOnly, vmguestOnly, hostLike} {
 			for name, set := range group {
 				if set {
-					resp.Diagnostics.AddAttributeError(
+					diags.AddAttributeError(
 						path.Root(name),
 						"Session Argument Without session_type",
 						fmt.Sprintf("%s is set but session_type is not. Set session_type to \"winrm\", \"ssh\", or \"vmguest\" to open a remote session, or remove the session_* arguments to run scripts locally.", name),
@@ -485,7 +578,7 @@ func (p *PowerShellProvider) ValidateConfig(ctx context.Context, req provider.Va
 	requireUnset := func(group map[string]bool, allowedType string) {
 		for name, set := range group {
 			if set {
-				resp.Diagnostics.AddAttributeError(
+				diags.AddAttributeError(
 					path.Root(name),
 					"Session Argument Not Applicable",
 					fmt.Sprintf("%s only applies when session_type is %q, but session_type is %q.", name, allowedType, sessionType),
@@ -497,7 +590,7 @@ func (p *PowerShellProvider) ValidateConfig(ctx context.Context, req provider.Va
 	switch sessionType {
 	case "winrm", "ssh":
 		if !isSet(config.SessionHost) && !config.SessionHost.IsUnknown() {
-			resp.Diagnostics.AddAttributeError(
+			diags.AddAttributeError(
 				path.Root("session_host"),
 				"Missing Remote Host",
 				fmt.Sprintf("session_host is required when session_type is %q.", sessionType),
@@ -512,14 +605,14 @@ func (p *PowerShellProvider) ValidateConfig(ctx context.Context, req provider.Va
 	case "vmguest":
 		if !vmguestOnly["session_vm_name"] && !vmguestOnly["session_vm_id"] &&
 			!config.SessionVMName.IsUnknown() && !config.SessionVMId.IsUnknown() {
-			resp.Diagnostics.AddAttributeError(
+			diags.AddAttributeError(
 				path.Root("session_vm_name"),
 				"Missing VM Identifier",
 				"session_type \"vmguest\" requires session_vm_name or session_vm_id.",
 			)
 		}
 		if vmguestOnly["session_vm_name"] && vmguestOnly["session_vm_id"] {
-			resp.Diagnostics.AddAttributeError(
+			diags.AddAttributeError(
 				path.Root("session_vm_name"),
 				"Conflicting VM Identifiers",
 				"Set only one of session_vm_name or session_vm_id, not both.",

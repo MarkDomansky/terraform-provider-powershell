@@ -147,7 +147,8 @@ Manages a resource through PowerShell CRUD scriptblocks.
 | `timeout`               | Number        | No       | Per-resource timeout override (seconds). |
 
 A read-only **`powershell_script` data source** is also available for scripts that
-only fetch data — see [docs/data-sources/script.md](docs/data-sources/script.md).
+only fetch data — see [Data Source: `powershell_script`](#data-source-powershell_script)
+below.
 
 ### Script Contract
 
@@ -231,6 +232,67 @@ output "resource_path" {
   value = jsondecode(powershell_script.example.output_data).path
 }
 ```
+
+## Data Source: `powershell_script`
+
+Reads data through a read-only PowerShell script — the PowerShell counterpart of
+the `hashicorp/external` data source. Use it to look things up; use the resource
+when Terraform should own an object's lifecycle.
+
+The script runs in the same persistent process (and remote session) as every
+resource, so it can read `$global:ProviderData` and any globals seeded by
+`startup_script`.
+
+```hcl
+data "powershell_script" "os_info" {
+  script = <<-PS
+    $os = [System.Environment]::OSVersion
+    [PSCustomObject]@{
+      platform = "$($os.Platform)"
+      version  = "$($os.Version)"
+      machine  = [System.Environment]::MachineName
+    }
+  PS
+}
+
+# output_data is JSON in the same shape input_data expects — pass it straight through.
+resource "powershell_script" "report" {
+  create_script = "..."
+  read_script   = "..."
+  delete_script = "..."
+
+  input_data = data.powershell_script.os_info.output_data
+}
+
+output "machine" {
+  value = jsondecode(data.powershell_script.os_info.output_data).machine
+}
+```
+
+### Schema
+
+| Attribute               | Type          | Required | Description |
+|-------------------------|---------------|----------|-------------|
+| `script`                | String        | Yes      | Read-only script. Must emit **at most one** object. Runs with `$Action = "read"`. |
+| `input_data`            | String (JSON) | No       | Input delivered through the bound `$InputData` parameter. Use `jsonencode()`. |
+| `sensitive_input_data`  | String (JSON) | No       | Sensitive input, merged into `$InputData` after `input_data` (sensitive wins on collision). Redacted from plan output; still stored in state. |
+| `output_data`           | String (JSON) | Computed | The object the script emitted, excluding the reserved `sensitive` key. `"{}"` if the script emitted nothing. |
+| `sensitive_output_data` | String (JSON) | Computed | The value emitted under the reserved top-level `sensitive` key (`"{}"` when absent). Redacted from plan output. |
+| `timeout`               | Number        | No       | Per-read timeout override (seconds). |
+
+The script contract is the resource's contract with two differences: `$Action` is
+always `"read"`, and emitting **nothing** is valid (it yields `output_data = "{}"`
+rather than signalling deletion — a data source has no state to remove).
+
+> **It runs on every plan.** The script executes during refresh on every `plan`
+> and `apply`, and nothing is persisted between runs. Keep it read-only and cheap.
+> When a resource's `input_data` references a data source's `output_data`, a
+> changed lookup result shows up as a proposed update on the next plan — that is
+> how external reality enters your plan.
+
+See [docs/data-sources/script.md](docs/data-sources/script.md) for secret
+handling, not-found behaviour, and ordering details, and
+[examples/data-source/](examples/data-source/) for a runnable config.
 
 ## Submodule Pattern (Recommended)
 
@@ -433,7 +495,7 @@ resource "powershell_script" "example" {
 ### Run Go Unit Tests
 
 ```bash
-go test ./internal/provider/ -v -timeout 120s
+go test ./scriptprovider/ -v -timeout 120s
 ```
 
 ### Run Pester Tests
