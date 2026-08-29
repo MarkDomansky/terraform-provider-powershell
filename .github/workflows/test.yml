@@ -108,7 +108,7 @@ jobs:
           chmod +x pshost
           sudo mv pshost /usr/local/bin/
       - name: Run unit tests
-        run: go test ./internal/provider/ -v -timeout 120s
+        run: go test ./scriptprovider/ -v -timeout 120s
 
   pester-test:
     name: Pester E2E Tests (real terraform)

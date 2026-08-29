@@ -27,7 +27,7 @@ run gives two things:
   connections, or caches and reuse them.
 
 The Go side that drives this process lives in
-[`internal/provider/ps_manager.go`](../internal/provider/ps_manager.go).
+[`scriptprovider/ps_manager.go`](../scriptprovider/ps_manager.go).
 
 ## Projects
 

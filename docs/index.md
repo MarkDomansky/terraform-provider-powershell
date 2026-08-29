@@ -8,6 +8,12 @@ description: |-
 
 The PowerShell provider enables Terraform to manage any resource that PowerShell can reach by defining CRUD operations as PowerShell scripts. It maintains a persistent PowerShell process for the lifetime of the Terraform run, enabling provider-level state sharing across all resource operations.
 
+It ships two things: the [`powershell_script` resource](resources/script.md), which
+gives Terraform ownership of an object's lifecycle, and the
+[`powershell_script` data source](data-sources/script.md), a read-only lookup that
+runs during refresh. Both execute in the same persistent process, so both see the
+globals your `startup_script` seeds.
+
 ## Requirements
 
 - [Terraform](https://www.terraform.io/downloads) >= 1.0
