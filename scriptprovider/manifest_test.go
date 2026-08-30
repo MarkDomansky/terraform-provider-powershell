@@ -7,6 +7,7 @@ import (
 
 func TestParseManifestValid(t *testing.T) {
 	data := []byte(`{
+		"$schema": "https://json.schemastore.org/tfpowershell-resource.json",
 		"version": 1,
 		"description": "A thing.",
 		"timeout_seconds": 600,
@@ -22,9 +23,14 @@ func TestParseManifestValid(t *testing.T) {
 			"token":   {"type": "string", "computed": true, "sensitive": true}
 		}
 	}`)
-	m, err := parseManifest(data, manifestResource, "test/schema.json")
+	m, err := parseManifest(data, manifestResource, "test/resource.tfps.json")
 	if err != nil {
 		t.Fatalf("expected valid manifest, got: %v", err)
+	}
+	// "$schema" is the one key strict decoding tolerates: accepted, retained,
+	// and never acted on.
+	if m.Schema != "https://json.schemastore.org/tfpowershell-resource.json" {
+		t.Errorf("$schema = %q, want the schemastore URL", m.Schema)
 	}
 	if m.TimeoutSeconds != 600 {
 		t.Errorf("timeout_seconds = %d, want 600", m.TimeoutSeconds)
@@ -119,7 +125,7 @@ func TestParseManifestErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			_, err := parseManifest([]byte(tc.json), tc.kind, "test/schema.json")
+			_, err := parseManifest([]byte(tc.json), tc.kind, "test/resource.tfps.json")
 			if err == nil {
 				t.Fatalf("expected an error containing %q, got nil", tc.wantErr)
 			}
@@ -139,7 +145,7 @@ func TestParseManifestDefaults(t *testing.T) {
 			"opts":  {"type": "json", "optional": true, "default": {"x": 1}}
 		}
 	}`)
-	m, err := parseManifest(data, manifestDataSource, "test/schema.json")
+	m, err := parseManifest(data, manifestDataSource, "test/resource.tfps.json")
 	if err != nil {
 		t.Fatalf("expected valid manifest, got: %v", err)
 	}
@@ -165,7 +171,7 @@ func TestBuildSchemasFromManifest(t *testing.T) {
 			"status": {"type": "string", "computed": true}
 		}
 	}`)
-	m, err := parseManifest(data, manifestResource, "test/schema.json")
+	m, err := parseManifest(data, manifestResource, "test/resource.tfps.json")
 	if err != nil {
 		t.Fatalf("parse: %v", err)
 	}
@@ -193,7 +199,7 @@ func TestBuildSchemasFromManifest(t *testing.T) {
 			"status": {"type": "string", "computed": true}
 		}
 	}`)
-	dm, err := parseManifest(dsData, manifestDataSource, "test/schema.json")
+	dm, err := parseManifest(dsData, manifestDataSource, "test/resource.tfps.json")
 	if err != nil {
 		t.Fatalf("parse as data source: %v", err)
 	}
@@ -212,7 +218,7 @@ func TestBuildSchemasFromManifest(t *testing.T) {
 			"endpoint": {"type": "string", "optional": true, "env": "SAMPLE_ENDPOINT"}
 		}
 	}`)
-	pm, err := parseManifest(pdata, manifestProvider, "test/schema.json")
+	pm, err := parseManifest(pdata, manifestProvider, "test/resource.tfps.json")
 	if err != nil {
 		t.Fatalf("parse provider manifest: %v", err)
 	}

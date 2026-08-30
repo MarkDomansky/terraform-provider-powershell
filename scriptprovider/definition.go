@@ -18,8 +18,23 @@ import (
 	rschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
 )
 
+// Manifest filenames inside the provider/ tree. They are deliberately
+// distinctive rather than a generic schema.json so that editors can associate
+// the published JSON Schemas (https://json.schemastore.org/tfpowershell-*.json)
+// by filename alone, with no per-file $schema key and no directory-scoped glob.
+const (
+	// Provider-level files, at fixed paths.
+	providerSettingsPath = "provider/settings.tfps.json"
+	providerManifestPath = "provider/provider.tfps.json"
+
+	// Per-folder manifests, one inside each provider/resources/<name>/ and
+	// provider/data-sources/<name>/ directory.
+	resourceManifestName   = "resource.tfps.json"
+	dataSourceManifestName = "datasource.tfps.json"
+)
+
 // Settings identifies a definition-based (derived) provider. It is authored by
-// the fork as provider/settings.json and read from the embedded filesystem.
+// the fork as provider/settings.tfps.json and read from the embedded filesystem.
 type Settings struct {
 	// Name is the provider type name, e.g. "exchangeonlinemanagement". It
 	// prefixes every resource and data source type.
@@ -72,7 +87,7 @@ type DataSourceDefinition struct {
 type providerDefinition struct {
 	settings         Settings
 	version          string
-	providerManifest *Manifest // nil when provider/schema.json is absent
+	providerManifest *Manifest // nil when provider/provider.tfps.json is absent
 	customAttrs      map[string]pschema.Attribute
 	startupScript    string // provider/scripts/startup.ps1, "" when absent
 	shutdownScript   string // provider/scripts/shutdown.ps1, "" when absent
@@ -135,22 +150,22 @@ func loadDefinition(def Definition) (*providerDefinition, error) {
 	}
 
 	// Optional provider-level manifest (custom provider-block attributes).
-	if data, err := readOptionalFile(def.FS, "provider/schema.json"); err != nil {
+	if data, err := readOptionalFile(def.FS, providerManifestPath); err != nil {
 		return nil, err
 	} else if data != nil {
-		m, err := parseManifest(data, manifestProvider, "provider/schema.json")
+		m, err := parseManifest(data, manifestProvider, providerManifestPath)
 		if err != nil {
 			return nil, err
 		}
 		builtin := builtinProviderAttributes()
 		for name := range m.Attributes {
 			if _, taken := builtin[name]; taken {
-				return nil, fmt.Errorf("provider/schema.json: attribute %q collides with a built-in provider attribute", name)
+				return nil, fmt.Errorf("%s: attribute %q collides with a built-in provider attribute", providerManifestPath, name)
 			}
 		}
 		attrs, err := buildProviderAttributes(m)
 		if err != nil {
-			return nil, fmt.Errorf("provider/schema.json: %w", err)
+			return nil, fmt.Errorf("%s: %w", providerManifestPath, err)
 		}
 		pd.providerManifest = m
 		pd.customAttrs = attrs
@@ -197,15 +212,18 @@ func loadDefinition(def Definition) (*providerDefinition, error) {
 	return pd, nil
 }
 
-// LoadSettings reads and validates provider/settings.json from the given
+// LoadSettings reads and validates provider/settings.tfps.json from the given
 // filesystem. The fork's managed main.go uses this so the identity lives in
 // exactly one user-owned file.
 func LoadSettings(fsys fs.FS) (Settings, error) {
-	data, err := fs.ReadFile(fsys, "provider/settings.json")
+	data, err := fs.ReadFile(fsys, providerSettingsPath)
 	if err != nil {
-		return Settings{}, fmt.Errorf("provider/settings.json: %w", err)
+		return Settings{}, fmt.Errorf("%s: %w", providerSettingsPath, err)
 	}
 	var raw struct {
+		// Schema is the editor's JSON Schema pointer. It carries no provider
+		// semantics; it is declared only so strict decoding accepts it.
+		Schema        string `json:"$schema"`
 		Name          string `json:"name"`
 		Address       string `json:"address"`
 		Repository    string `json:"repository"`
@@ -214,39 +232,40 @@ func LoadSettings(fsys fs.FS) (Settings, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&raw); err != nil {
-		return Settings{}, fmt.Errorf("provider/settings.json: %w", err)
+		return Settings{}, fmt.Errorf("%s: %w", providerSettingsPath, err)
 	}
 	s := Settings{Name: raw.Name, Address: raw.Address}
 	if !attrNamePattern.MatchString(s.Name) {
-		return Settings{}, fmt.Errorf(`provider/settings.json: "name" %q must match %s`, s.Name, attrNamePattern.String())
+		return Settings{}, fmt.Errorf(`%s: "name" %q must match %s`, providerSettingsPath, s.Name, attrNamePattern.String())
 	}
 	if s.Address == "" {
-		return Settings{}, fmt.Errorf(`provider/settings.json: "address" is required`)
+		return Settings{}, fmt.Errorf(`%s: "address" is required`, providerSettingsPath)
 	}
 	return s, nil
 }
 
-// loadResourceDefinition loads provider/resources/<name>/: schema.json plus
-// create/read/delete.ps1 (required) and update.ps1 (optional — its presence
-// alone decides update-vs-replace semantics).
+// loadResourceDefinition loads provider/resources/<name>/: resource.tfps.json
+// plus create/read/delete.ps1 (required) and update.ps1 (optional — its
+// presence alone decides update-vs-replace semantics).
 func loadResourceDefinition(fsys fs.FS, name string) (*ResourceDefinition, error) {
 	dir := path.Join("provider/resources", name)
 	if !attrNamePattern.MatchString(name) {
 		return nil, fmt.Errorf("%s: resource directory name must match %s", dir, attrNamePattern.String())
 	}
 
-	data, err := fs.ReadFile(fsys, path.Join(dir, "schema.json"))
+	manifestPath := path.Join(dir, resourceManifestName)
+	data, err := fs.ReadFile(fsys, manifestPath)
 	if err != nil {
-		return nil, fmt.Errorf("%s: every resource folder needs a schema.json: %w", dir, err)
+		return nil, fmt.Errorf("%s: every resource folder needs a %s: %w", dir, resourceManifestName, err)
 	}
-	m, err := parseManifest(data, manifestResource, path.Join(dir, "schema.json"))
+	m, err := parseManifest(data, manifestResource, manifestPath)
 	if err != nil {
 		return nil, err
 	}
 
 	schema, err := buildResourceSchema(m)
 	if err != nil {
-		return nil, fmt.Errorf("%s/schema.json: %w", dir, err)
+		return nil, fmt.Errorf("%s: %w", manifestPath, err)
 	}
 
 	var scripts ScriptSet
@@ -279,26 +298,27 @@ func loadResourceDefinition(fsys fs.FS, name string) (*ResourceDefinition, error
 	}, nil
 }
 
-// loadDataSourceDefinition loads provider/data-sources/<name>/: schema.json
-// plus read.ps1.
+// loadDataSourceDefinition loads provider/data-sources/<name>/:
+// datasource.tfps.json plus read.ps1.
 func loadDataSourceDefinition(fsys fs.FS, name string) (*DataSourceDefinition, error) {
 	dir := path.Join("provider/data-sources", name)
 	if !attrNamePattern.MatchString(name) {
 		return nil, fmt.Errorf("%s: data source directory name must match %s", dir, attrNamePattern.String())
 	}
 
-	data, err := fs.ReadFile(fsys, path.Join(dir, "schema.json"))
+	manifestPath := path.Join(dir, dataSourceManifestName)
+	data, err := fs.ReadFile(fsys, manifestPath)
 	if err != nil {
-		return nil, fmt.Errorf("%s: every data-source folder needs a schema.json: %w", dir, err)
+		return nil, fmt.Errorf("%s: every data-source folder needs a %s: %w", dir, dataSourceManifestName, err)
 	}
-	m, err := parseManifest(data, manifestDataSource, path.Join(dir, "schema.json"))
+	m, err := parseManifest(data, manifestDataSource, manifestPath)
 	if err != nil {
 		return nil, err
 	}
 
 	schema, err := buildDataSourceSchema(m)
 	if err != nil {
-		return nil, fmt.Errorf("%s/schema.json: %w", dir, err)
+		return nil, fmt.Errorf("%s: %w", manifestPath, err)
 	}
 
 	read, err := fs.ReadFile(fsys, path.Join(dir, "read.ps1"))
