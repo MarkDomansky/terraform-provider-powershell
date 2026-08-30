@@ -3,7 +3,9 @@
 * `scriptprovider/` is a PUBLIC Go package consumed by derived providers built
   from TEMPLATE-terraform-provider-YOURPROVIDER (see
   docs/guides/derived-providers.md). Changing its exported surface, the
-  schema.json manifest format, or the release-zip layout (pshost at the zip
+  manifest format or filenames (`resource.tfps.json`, `datasource.tfps.json`,
+  `provider.tfps.json`, `settings.tfps.json` - defined as constants in
+  scriptprovider/definition.go), or the release-zip layout (pshost at the zip
   root) breaks forks - treat those as breaking changes even though semver maps
   breaking to minor.
 

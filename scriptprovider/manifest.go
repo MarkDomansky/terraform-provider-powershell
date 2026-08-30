@@ -8,8 +8,8 @@ import (
 	"sort"
 )
 
-// manifestKind selects the validation rules for a schema.json manifest: the
-// three contexts share one format but allow different attribute settings.
+// manifestKind selects the validation rules for a manifest file: the three
+// contexts share one format but allow different attribute settings.
 type manifestKind int
 
 const (
@@ -47,9 +47,16 @@ const (
 // resource/data-source directory names.
 var attrNamePattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
-// Manifest is a parsed schema.json. One format serves resources, data sources,
-// and the provider block; parseManifest enforces the per-context restrictions.
+// Manifest is a parsed resource.tfps.json, datasource.tfps.json, or
+// provider.tfps.json. One format serves all three; parseManifest enforces the
+// per-context restrictions.
 type Manifest struct {
+	// Schema is the editor's JSON Schema pointer (the "$schema" key). It
+	// carries no provider semantics and is never read after decoding; it is
+	// declared only so that strict decoding accepts it. See
+	// https://json.schemastore.org/tfpowershell-resource.json and siblings.
+	Schema string `json:"$schema"`
+
 	Version        int                  `json:"version"`
 	Description    string               `json:"description"`
 	TimeoutSeconds int64                `json:"timeout_seconds"`
@@ -107,11 +114,12 @@ func (m *Manifest) computedNames() []string {
 	return names
 }
 
-// parseManifest decodes and validates one schema.json. Parsing is strict:
-// unknown top-level, per-attribute, or per-validator keys are errors, so a
-// manifest written for a future engine can never be silently half-applied by
-// an old one. source names the file in error messages (e.g.
-// "provider/resources/mailbox/schema.json").
+// parseManifest decodes and validates one manifest. Parsing is strict: unknown
+// top-level, per-attribute, or per-validator keys are errors, so a manifest
+// written for a future engine can never be silently half-applied by an old one.
+// The one exception is "$schema", which is decoded into Manifest.Schema and
+// ignored. source names the file in error messages (e.g.
+// "provider/resources/mailbox/resource.tfps.json").
 func parseManifest(data []byte, kind manifestKind, source string) (*Manifest, error) {
 	dec := json.NewDecoder(bytes.NewReader(data))
 	dec.DisallowUnknownFields()

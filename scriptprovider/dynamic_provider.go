@@ -27,7 +27,7 @@ type definitionProvider struct {
 	psManager *PSManager // nil until Configure runs
 }
 
-// Metadata reports the derived provider's type name (from settings.json) and
+// Metadata reports the derived provider's type name (from settings.tfps.json) and
 // version. The type name prefixes every resource, e.g. "<name>_<resource>".
 func (p *definitionProvider) Metadata(_ context.Context, _ provider.MetadataRequest, resp *provider.MetadataResponse) {
 	resp.TypeName = p.def.settings.Name
