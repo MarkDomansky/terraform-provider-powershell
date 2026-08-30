@@ -22,12 +22,16 @@ import (
 func testDefinitionFS() fstest.MapFS {
 	file := func(s string) *fstest.MapFile { return &fstest.MapFile{Data: []byte(s)} }
 	return fstest.MapFS{
-		"provider/settings.json": file(`{
+		// settings and the provider manifest carry a "$schema" pointer: the
+		// loaders must accept and ignore it despite strict decoding.
+		"provider/settings.tfps.json": file(`{
+			"$schema": "https://json.schemastore.org/tfpowershell-settings.json",
 			"name": "sampletest",
 			"address": "registry.terraform.io/test/sampletest",
 			"engine_version": "latest"
 		}`),
-		"provider/schema.json": file(`{
+		"provider/provider.tfps.json": file(`{
+			"$schema": "https://json.schemastore.org/tfpowershell-provider.json",
 			"version": 1,
 			"description": "Test provider.",
 			"attributes": {
@@ -38,7 +42,8 @@ func testDefinitionFS() fstest.MapFS {
 			`$global:DerivedTestState = @{ endpoint = $global:ProviderData.Config.endpoint }`),
 		"provider/scripts/shutdown.ps1": file(
 			`$global:DerivedTestState = $null`),
-		"provider/resources/item/schema.json": file(`{
+		"provider/resources/item/resource.tfps.json": file(`{
+			"$schema": "https://json.schemastore.org/tfpowershell-resource.json",
 			"version": 1,
 			"description": "An item.",
 			"attributes": {
@@ -57,7 +62,7 @@ func testDefinitionFS() fstest.MapFS {
 		"provider/resources/item/delete.ps1": file(
 			`@{ id = $InputData.id }`),
 		// A resource without update.ps1: config changes must force replacement.
-		"provider/resources/fixed/schema.json": file(`{
+		"provider/resources/fixed/resource.tfps.json": file(`{
 			"version": 1,
 			"attributes": {
 				"name":   {"type": "string", "required": true},
@@ -67,7 +72,7 @@ func testDefinitionFS() fstest.MapFS {
 		"provider/resources/fixed/create.ps1": file(`@{ id = "fixed-$($InputData.name)"; status = "ok" }`),
 		"provider/resources/fixed/read.ps1":   file(`@{ id = $InputData.id; status = "ok" }`),
 		"provider/resources/fixed/delete.ps1": file(`@{ id = $InputData.id }`),
-		"provider/data-sources/lookup/schema.json": file(`{
+		"provider/data-sources/lookup/datasource.tfps.json": file(`{
 			"version": 1,
 			"attributes": {
 				"query":  {"type": "string", "required": true},
@@ -142,7 +147,7 @@ func TestLoadDefinitionErrors(t *testing.T) {
 
 	t.Run("builtin attribute collision", func(t *testing.T) {
 		fs := base()
-		fs["provider/schema.json"] = &fstest.MapFile{Data: []byte(`{
+		fs["provider/provider.tfps.json"] = &fstest.MapFile{Data: []byte(`{
 			"version": 1,
 			"attributes": {"timeout": {"type": "int", "optional": true}}
 		}`)}
@@ -161,7 +166,7 @@ func TestLoadDefinitionErrors(t *testing.T) {
 
 	t.Run("reserved id attribute", func(t *testing.T) {
 		fs := base()
-		fs["provider/resources/item/schema.json"] = &fstest.MapFile{Data: []byte(`{
+		fs["provider/resources/item/resource.tfps.json"] = &fstest.MapFile{Data: []byte(`{
 			"version": 1,
 			"attributes": {"id": {"type": "string", "computed": true}}
 		}`)}
